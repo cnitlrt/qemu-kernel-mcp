@@ -4,7 +4,7 @@ MCP server for Linux kernel vulnerability research workflows.
 
 ### Features
 
-- `set_poc`: set PoC executable/script file for guest runtime.
+- `set_poc`: verify PoC is a statically linked ELF, then push it into guest as `/bin/exp` (prefer `wget`, fallback to serial chunk upload).
 - `run_qemu`: start QEMU and auto-assign gdb port.
 - `run_command`: execute commands in guest through one-shot `nc` over serial (tmux kept for QEMU session management).
 - `run_poc`: run PoC command in guest.
@@ -32,6 +32,7 @@ uv run qemu-kernel-mcp --transport streamable-http --host 0.0.0.0 --port 8000
 
 - `run_qemu` invokes `scripts/get_root.sh <release_name>`.
 - `run_qemu` returns `session_id`; `run_command`/`run_poc` can pass `session_id`.
+- `set_poc` requires a running QEMU session (uses active session by default or accepts `session_id`).
 - Host dependencies for command execution: `tmux`, `nc`.
 - GDB remote target:
   - `target remote 127.0.0.1:<gdb_port>`

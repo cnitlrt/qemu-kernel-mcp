@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-import os
+import contextlib
+import functools
+import http.server
 import re
 import shlex
 import shutil
@@ -10,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .config import POC_TARGET, SCRIPTS_DIR, STATE_DIR
+from .config import SCRIPTS_DIR, STATE_DIR
 from .models import QemuSession, ServerState
 from .utils import allocate_port, run_cmd
 
@@ -20,19 +22,53 @@ class KernelPwnService:
         self.state = ServerState()
         self._lock = threading.Lock()
 
-    def set_poc(self, poc_file: str) -> dict[str, Any]:
+    def set_poc(self, poc_file: str, session_id: str | None = None) -> dict[str, Any]:
         source = Path(poc_file).expanduser().resolve()
         if not source.exists():
             return {"ok": False, "error": f"poc file not found: {source}"}
         if not source.is_file():
             return {"ok": False, "error": f"poc path is not a file: {source}"}
+        static_check = self._check_static_binary(source)
+        if not static_check["ok"]:
+            return static_check
 
         with self._lock:
-            POC_TARGET.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, POC_TARGET)
-            os.chmod(POC_TARGET, 0o755)
+            session = self._resolve_session(session_id)
+            if session is None:
+                return {"ok": False, "error": "no running qemu session for set_poc"}
+
+            http_port = allocate_port()
+            poc_name = source.name
+            guest_url = f"http://10.0.2.2:{http_port}/{poc_name}"
+            cmd = (
+                f"(wget -qO /bin/exp {shlex.quote(guest_url)} "
+                f"|| busybox wget -qO /bin/exp {shlex.quote(guest_url)}) && "
+                "chmod +x /bin/exp"
+            )
+            with self._temporary_http_server(source.parent, http_port):
+                transfer = self._run_nc_command(session, cmd, timeout=30)
+            method = "wget"
+            if transfer["returncode"] != 0:
+                fallback = self._upload_poc_via_serial_chunks(session, source)
+                if not fallback["ok"]:
+                    return {
+                        "ok": False,
+                        "error": "failed to transfer poc into guest via wget and serial fallback",
+                        "wget_details": transfer,
+                        "fallback_details": fallback,
+                    }
+                method = "serial-chunks"
+
             self.state.poc_path = source
-            return {"ok": True, "poc_path": str(source), "vm_path": "/bin/exp"}
+            return {
+                "ok": True,
+                "poc_path": str(source),
+                "is_static": True,
+                "session_id": session.session_id,
+                "download_url": guest_url,
+                "transfer_method": method,
+                "vm_path": "/bin/exp",
+            }
 
     def run_qemu(self, release_name: str) -> dict[str, Any]:
         with self._lock:
@@ -143,20 +179,15 @@ class KernelPwnService:
         begin = f"__MCP_BEGIN_{uuid4().hex[:8]}__"
         end = f"__MCP_END_{uuid4().hex[:8]}__"
         payload = f"echo {begin}; {command}; rc=$?; echo {end}:$rc\n"
-        nc_idle = str(max(1, min(timeout, 10)))
-        try:
-            proc = subprocess.run(
-                ["nc", "-w", nc_idle, "127.0.0.1", str(session.serial_port)],
-                input=payload,
-                text=True,
-                capture_output=True,
-                timeout=timeout + 2,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            return {"returncode": 124, "stdout": "", "stderr": "nc command timeout"}
+        fast_idle = str(max(1, min(timeout, 2)))
+        slow_idle = str(max(3, min(timeout, 6)))
 
+        proc = self._run_nc_once(session.serial_port, payload, fast_idle, prefer_quick_close=True, timeout=timeout)
         captured = proc.stdout or ""
+        if end not in captured:
+            # Compatibility fallback: avoid -q and allow slightly longer idle window.
+            proc = self._run_nc_once(session.serial_port, payload, slow_idle, prefer_quick_close=False, timeout=timeout)
+            captured = proc.stdout or ""
         if end not in captured:
             return {
                 "returncode": 124,
@@ -168,6 +199,121 @@ class KernelPwnService:
         rc = int(match.group(1)) if match else proc.returncode
         output = self._clean_nc_output(captured, begin, end)
         return {"returncode": rc, "stdout": output, "stderr": (proc.stderr or "").strip()}
+
+    @staticmethod
+    def _run_nc_once(
+        serial_port: int,
+        payload: str,
+        idle_seconds: str,
+        prefer_quick_close: bool,
+        timeout: int,
+    ) -> subprocess.CompletedProcess[str]:
+        if prefer_quick_close:
+            cmd = ["nc", "-w", idle_seconds, "-q", "0", "127.0.0.1", str(serial_port)]
+        else:
+            cmd = ["nc", "-w", idle_seconds, "127.0.0.1", str(serial_port)]
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=payload,
+                text=True,
+                capture_output=True,
+                timeout=timeout + 2,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(cmd, 124, "", "nc command timeout")
+
+        if prefer_quick_close and proc.returncode != 0 and "invalid option" in (proc.stderr or "").lower():
+            try:
+                proc = subprocess.run(
+                    ["nc", "-w", idle_seconds, "127.0.0.1", str(serial_port)],
+                    input=payload,
+                    text=True,
+                    capture_output=True,
+                    timeout=timeout + 2,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                return subprocess.CompletedProcess(cmd, 124, "", "nc command timeout")
+        return proc
+
+    def _upload_poc_via_serial_chunks(self, session: QemuSession, source: Path) -> dict[str, Any]:
+        data = source.read_bytes()
+        start = self._run_nc_command(session, ": > /bin/exp", timeout=10)
+        if start["returncode"] != 0:
+            return {"ok": False, "stage": "truncate", "details": start}
+
+        chunk_size = 128
+        for idx in range(0, len(data), chunk_size):
+            chunk = data[idx:idx + chunk_size]
+            escaped = "".join(f"\\{byte:03o}" for byte in chunk)
+            cmd = f"printf '{escaped}' >> /bin/exp"
+            res = self._run_nc_command(session, cmd, timeout=20)
+            if res["returncode"] != 0:
+                return {
+                    "ok": False,
+                    "stage": "write-chunk",
+                    "offset": idx,
+                    "details": res,
+                }
+
+        chmod_res = self._run_nc_command(session, "chmod +x /bin/exp", timeout=10)
+        if chmod_res["returncode"] != 0:
+            return {"ok": False, "stage": "chmod", "details": chmod_res}
+
+        verify = self._run_nc_command(session, "wc -c < /bin/exp", timeout=10)
+        if verify["returncode"] != 0:
+            return {"ok": False, "stage": "verify-size", "details": verify}
+
+        size_str = (verify["stdout"] or "").strip()
+        try:
+            guest_size = int(size_str.splitlines()[-1].strip())
+        except (ValueError, IndexError):
+            return {"ok": False, "stage": "parse-size", "details": verify}
+        if guest_size != len(data):
+            return {
+                "ok": False,
+                "stage": "size-mismatch",
+                "expected_size": len(data),
+                "guest_size": guest_size,
+            }
+
+        return {"ok": True}
+
+    @staticmethod
+    def _check_static_binary(path: Path) -> dict[str, Any]:
+        file_info = run_cmd(["file", "-b", str(path)], timeout=10)
+        if not file_info["ok"]:
+            return {"ok": False, "error": "failed to inspect poc binary", "details": file_info}
+        desc = (file_info["stdout"] or "").lower()
+        if "elf" not in desc:
+            return {"ok": False, "error": "poc file is not an ELF binary", "file_output": file_info["stdout"]}
+        if "statically linked" not in desc:
+            return {
+                "ok": False,
+                "error": "poc binary is not statically linked",
+                "file_output": file_info["stdout"],
+            }
+        return {"ok": True}
+
+    @contextlib.contextmanager
+    def _temporary_http_server(self, directory: Path, port: int):
+        class QuietHandler(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:
+                return
+
+        handler = functools.partial(QuietHandler, directory=str(directory))
+        server = http.server.ThreadingHTTPServer(("0.0.0.0", port), handler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
 
     @staticmethod
     def _clean_nc_output(captured: str, begin: str, end: str) -> str:

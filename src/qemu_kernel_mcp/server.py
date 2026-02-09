@@ -26,9 +26,9 @@ def create_app(
     svc = KernelPwnService()
 
     @mcp.tool()
-    def set_poc(poc_file: str) -> dict[str, Any]:
-        """Set PoC binary/script to be used inside QEMU."""
-        return svc.set_poc(poc_file)
+    def set_poc(poc_file: str, session_id: str = "") -> dict[str, Any]:
+        """Validate static PoC binary and download it into guest as /bin/exp via wget."""
+        return svc.set_poc(poc_file, session_id=session_id or None)
 
     @mcp.tool()
     def run_qemu(release_name: str = "mitigation-v4-6.6") -> dict[str, Any]:
