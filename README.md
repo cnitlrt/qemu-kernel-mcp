@@ -1,0 +1,43 @@
+## qemu-kernel-mcp
+
+MCP server for Linux kernel vulnerability research workflows.
+
+### Features
+
+- `set_poc`: set PoC executable/script file for guest runtime.
+- `run_qemu`: start QEMU and auto-assign gdb port.
+- `run_command`: execute commands in guest through one-shot `nc` over serial (tmux kept for QEMU session management).
+- `run_poc`: run PoC command in guest.
+- `list_sessions`: list all active/stored QEMU sessions.
+- `stop_qemu`: stop a QEMU session by `session_id` (or active session).
+
+### Use uv
+
+```bash
+uv sync
+uv run qemu-kernel-mcp
+```
+
+HTTP transports:
+
+```bash
+# SSE
+uv run qemu-kernel-mcp --transport sse --host 0.0.0.0 --port 8000
+
+# Streamable HTTP (alias: --transport stream-http)
+uv run qemu-kernel-mcp --transport streamable-http --host 0.0.0.0 --port 8000
+```
+
+### Notes
+
+- `run_qemu` invokes `scripts/get_root.sh <release_name>`.
+- `run_qemu` returns `session_id`; `run_command`/`run_poc` can pass `session_id`.
+- Host dependencies for command execution: `tmux`, `nc`.
+- GDB remote target:
+  - `target remote 127.0.0.1:<gdb_port>`
+- `scripts/get_root.sh`:
+  - prepares runtime dependencies (`qemu_v3.sh`, `rootfs_v3.img`, `ramdisk_v1.img`, `flag`) when missing.
+  - unpacks/modifies initramfs (`core/init`, `core/test.sh`), rebuilds `rootfs.cpio`, then calls `local_runner.sh`.
+- `scripts/local_runner.sh`:
+  - ensures release kernel image (`releases/<release>/bzImage`) and required runtime files exist.
+  - launches QEMU through `qemu_v3.sh` with the selected release and init entry.

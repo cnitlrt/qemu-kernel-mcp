@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.python-version
+.venv/
+.mypy_cache/
+.pytest_cache/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Runtime state / logs
+.state/
+*.log
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Kernel / QEMU artifacts
+scripts/releases/
+scripts/rootfs.cpio
+scripts/rootfs_v3.img
+scripts/ramdisk_v1
+scripts/ramdisk_v1.img
+scripts/flag
+scripts/core
+
+# Local binaries / outputs
+exp
+bin/
+lib/
+lib64
+qemu_v3.sh
