@@ -195,10 +195,18 @@ class KernelPwnService:
                 "stderr": "marker not found in nc output",
             }
 
-        match = re.search(rf"{re.escape(end)}:(\d+)", captured)
-        rc = int(match.group(1)) if match else proc.returncode
-        output = self._clean_nc_output(captured, begin, end)
-        return {"returncode": rc, "stdout": output, "stderr": (proc.stderr or "").strip()}
+        parsed = self._extract_marked_output(captured, begin, end)
+        if not parsed["ok"]:
+            return {
+                "returncode": 124,
+                "stdout": parsed.get("output", ""),
+                "stderr": parsed["error"],
+            }
+        return {
+            "returncode": parsed["exit_code"],
+            "stdout": parsed["output"],
+            "stderr": (proc.stderr or "").strip(),
+        }
 
     @staticmethod
     def _run_nc_once(
@@ -316,15 +324,57 @@ class KernelPwnService:
             thread.join(timeout=1)
 
     @staticmethod
-    def _clean_nc_output(captured: str, begin: str, end: str) -> str:
-        start = captured.rfind(begin)
-        stop = captured.rfind(end)
-        if start == -1 or stop == -1 or stop < start:
-            return captured.strip()
-        content = captured[start + len(begin):stop]
-        lines = [ln for ln in content.splitlines() if ln.strip()]
+    def _extract_marked_output(captured: str, begin: str, end: str) -> dict[str, Any]:
+        lines = [line.replace("\r", "") for line in captured.splitlines()]
+        begin_idx = -1
+        begin_col = -1
+        end_idx = -1
+        exit_code: int | None = None
+        end_pattern = re.compile(rf"^{re.escape(end)}:(\d+)$")
+
+        for idx, line in enumerate(lines):
+            if begin_idx == -1:
+                pos = line.find(begin)
+                if pos != -1:
+                    begin_idx = idx
+                    begin_col = pos
+                    continue
+            if begin_idx != -1:
+                match = end_pattern.match(line.strip())
+                if match:
+                    end_idx = idx
+                    exit_code = int(match.group(1))
+                    break
+
+        if begin_idx == -1:
+            return {"ok": False, "error": "begin marker not found", "output": captured.strip()}
+        if end_idx == -1 or exit_code is None:
+            partial = KernelPwnService._collect_payload_lines(lines, begin_idx, begin_col, len(lines))
+            return {
+                "ok": False,
+                "error": "end marker with exit code not found (possible crash/timeout)",
+                "output": partial,
+            }
+
+        output = KernelPwnService._collect_payload_lines(lines, begin_idx, begin_col, end_idx)
+
+        return {"ok": True, "exit_code": exit_code, "output": output}
+
+    @staticmethod
+    def _collect_payload_lines(lines: list[str], begin_idx: int, begin_col: int, stop_idx: int) -> str:
+        payload_lines: list[str] = []
+        if begin_idx < stop_idx:
+            first_line = lines[begin_idx]
+            tail = first_line[begin_col + 1 :] if begin_col >= 0 else ""
+            if tail.strip():
+                payload_lines.append(tail)
+        payload_lines.extend(lines[begin_idx + 1:stop_idx])
+
         cleaned: list[str] = []
-        for line in lines:
+        for line in payload_lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
             if re.search(r".+[#$] $", line):
                 continue
             cleaned.append(line)
