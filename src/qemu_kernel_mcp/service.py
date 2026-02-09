@@ -6,11 +6,15 @@ import http.server
 import re
 import shlex
 import shutil
-import subprocess
 import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
+
+from pwnlib.context import context
+from pwnlib.tubes.remote import remote
 
 from .config import SCRIPTS_DIR, STATE_DIR
 from .models import QemuSession, ServerState
@@ -74,8 +78,25 @@ class KernelPwnService:
         with self._lock:
             if shutil.which("tmux") is None:
                 return {"ok": False, "error": "tmux not found on host"}
-            if shutil.which("nc") is None:
-                return {"ok": False, "error": "nc not found on host"}
+
+            cleanup_results: list[dict[str, Any]] = []
+            for old_session in list(self.state.qemu_sessions.values()):
+                was_running = self._tmux_session_exists(old_session.tmux_session)
+                if old_session.tmux_session:
+                    run_cmd(["tmux", "send-keys", "-t", old_session.tmux_session, "exit", "C-m"], timeout=3)
+                    run_cmd(["tmux", "kill-session", "-t", old_session.tmux_session], timeout=5)
+                with contextlib.suppress(Exception):
+                    run_cmd(["pkill", "-f", f"qemu-system-x86_64.*{old_session.gdb_port}"], timeout=3)
+                cleanup_results.append(
+                    {
+                        "session_id": old_session.session_id,
+                        "was_running": was_running,
+                        "still_running": self._tmux_session_exists(old_session.tmux_session),
+                    }
+                )
+
+            self.state.qemu_sessions.clear()
+            self.state.active_session_id = None
 
             gdb_port = allocate_port()
             serial_port = allocate_port()
@@ -109,12 +130,17 @@ class KernelPwnService:
             return {
                 "ok": True,
                 "session_id": session_id,
+                "cleanup": cleanup_results,
                 "session": self._session_payload(session),
                 "tips": {
                     "tmux_session": tmux_name,
                     "attach": f"tmux attach -t {tmux_name}",
                     "gdb_target": f"target remote 127.0.0.1:{gdb_port}",
-                    "serial_connect": f"nc 127.0.0.1 {serial_port}",
+                    "serial_connect": (
+                        "python3 -c 'from pwn import remote; "
+                        f"io=remote(\"127.0.0.1\", {serial_port}); "
+                        "io.interactive()'"
+                    ),
                     "log_file": str(log_path),
                 },
             }
@@ -179,22 +205,16 @@ class KernelPwnService:
         begin = f"__MCP_BEGIN_{uuid4().hex[:8]}__"
         end = f"__MCP_END_{uuid4().hex[:8]}__"
         payload = f"echo {begin}; {command}; rc=$?; echo {end}:$rc\n"
-        fast_idle = str(max(1, min(timeout, 2)))
-        slow_idle = str(max(3, min(timeout, 6)))
 
-        proc = self._run_nc_once(session.serial_port, payload, fast_idle, prefer_quick_close=True, timeout=timeout)
-        captured = proc.stdout or ""
-        if end not in captured:
-            # Compatibility fallback: avoid -q and allow slightly longer idle window.
-            proc = self._run_nc_once(session.serial_port, payload, slow_idle, prefer_quick_close=False, timeout=timeout)
-            captured = proc.stdout or ""
-        if end not in captured:
+        proc = self._run_nc_once(session.serial_port, payload, end_marker=end, timeout=timeout)
+        if proc.returncode != 0:
             return {
                 "returncode": 124,
-                "stdout": "",
-                "stderr": "marker not found in nc output",
+                "stdout": proc.stdout or "",
+                "stderr": (proc.stderr or "marker not found in serial output").strip(),
             }
 
+        captured = proc.stdout or ""
         parsed = self._extract_marked_output(captured, begin, end)
         if not parsed["ok"]:
             return {
@@ -212,39 +232,52 @@ class KernelPwnService:
     def _run_nc_once(
         serial_port: int,
         payload: str,
-        idle_seconds: str,
-        prefer_quick_close: bool,
+        end_marker: str,
         timeout: int,
-    ) -> subprocess.CompletedProcess[str]:
-        if prefer_quick_close:
-            cmd = ["nc", "-w", idle_seconds, "-q", "0", "127.0.0.1", str(serial_port)]
-        else:
-            cmd = ["nc", "-w", idle_seconds, "127.0.0.1", str(serial_port)]
+    ) -> Any:
+        io = None
+        connect_timeout = float(max(1, min(timeout, 3)))
+        deadline = time.monotonic() + max(1.0, float(timeout))
+        lines: list[str] = []
+        saw_end = False
         try:
-            proc = subprocess.run(
-                cmd,
-                input=payload,
-                text=True,
-                capture_output=True,
-                timeout=timeout + 2,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            return subprocess.CompletedProcess(cmd, 124, "", "nc command timeout")
+            with context.local(log_level="error"):
+                io = remote("127.0.0.1", serial_port, timeout=connect_timeout)
+                io.send(payload.encode())
 
-        if prefer_quick_close and proc.returncode != 0 and "invalid option" in (proc.stderr or "").lower():
-            try:
-                proc = subprocess.run(
-                    ["nc", "-w", idle_seconds, "127.0.0.1", str(serial_port)],
-                    input=payload,
-                    text=True,
-                    capture_output=True,
-                    timeout=timeout + 2,
-                    check=False,
+                while time.monotonic() < deadline:
+                    remaining = deadline - time.monotonic()
+                    line_timeout = max(0.05, min(0.25, remaining))
+                    try:
+                        raw = io.recvline(timeout=line_timeout)
+                    except EOFError:
+                        break
+                    if not raw:
+                        continue
+                    line = raw.decode(errors="replace").replace("\r", "").rstrip("\n")
+                    lines.append(line)
+                    if end_marker in line:
+                        saw_end = True
+                        break
+
+            captured = "\n".join(lines).strip()
+            if not saw_end:
+                return SimpleNamespace(
+                    returncode=124,
+                    stdout=captured,
+                    stderr="marker not found in serial output before timeout",
                 )
-            except subprocess.TimeoutExpired:
-                return subprocess.CompletedProcess(cmd, 124, "", "nc command timeout")
-        return proc
+            return SimpleNamespace(returncode=0, stdout=captured, stderr="")
+        except Exception as exc:
+            return SimpleNamespace(
+                returncode=124,
+                stdout="\n".join(lines).strip(),
+                stderr=f"pwntools command failed: {exc}",
+            )
+        finally:
+            if io is not None:
+                with contextlib.suppress(Exception):
+                    io.close()
 
     def _upload_poc_via_serial_chunks(self, session: QemuSession, source: Path) -> dict[str, Any]:
         data = source.read_bytes()
