@@ -95,6 +95,19 @@ if [ -f "$qemu_file" ]; then
 		"$qemu_file" > "$tmp_file"
 	mv "$tmp_file" "$qemu_file"
 
+	if ! grep -Fq -- "nokaslr" "$qemu_file"; then
+		tmp_file="$(mktemp)"
+		awk '
+		{
+			if ($0 ~ /-append "/ && $0 !~ /nokaslr/) {
+				sub(/-append "/, "-append \"nokaslr ")
+			}
+			print
+		}
+		' "$qemu_file" > "$tmp_file"
+		mv "$tmp_file" "$qemu_file"
+	fi
+
 	if ! grep -Fq -- "-serial tcp:127.0.0.1:\${QEMU_SERIAL_PORT}" "$qemu_file"; then
 		tmp_file="$(mktemp)"
 		awk '
@@ -102,6 +115,21 @@ if [ -f "$qemu_file" ]; then
 		{
 			if (!inserted && $0 ~ /-append "/) {
 				print "  -serial tcp:127.0.0.1:${QEMU_SERIAL_PORT},server=on,wait=off,nodelay=on,telnet=off \\"
+				inserted=1
+			}
+			print
+		}
+		' "$qemu_file" > "$tmp_file"
+		mv "$tmp_file" "$qemu_file"
+	fi
+
+	if ! grep -Fq -- "-gdb tcp:127.0.0.1:\${QEMU_GDB_PORT}" "$qemu_file"; then
+		tmp_file="$(mktemp)"
+		awk '
+		BEGIN { inserted=0 }
+		{
+			if (!inserted && $0 ~ /-append "/) {
+				print "  -gdb tcp:127.0.0.1:${QEMU_GDB_PORT} \\"
 				inserted=1
 			}
 			print

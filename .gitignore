@@ -35,4 +35,4 @@ bin/
 lib/
 lib64
 qemu_v3.sh
-test
+test*

@@ -80,18 +80,14 @@ class KernelPwnService:
                 return {"ok": False, "error": "tmux not found on host"}
 
             cleanup_results: list[dict[str, Any]] = []
-            for old_session in list(self.state.qemu_sessions.values()):
-                was_running = self._tmux_session_exists(old_session.tmux_session)
-                if old_session.tmux_session:
-                    run_cmd(["tmux", "send-keys", "-t", old_session.tmux_session, "exit", "C-m"], timeout=3)
-                    run_cmd(["tmux", "kill-session", "-t", old_session.tmux_session], timeout=5)
-                with contextlib.suppress(Exception):
-                    run_cmd(["pkill", "-f", f"qemu-system-x86_64.*{old_session.gdb_port}"], timeout=3)
+            tmux_sessions = self._list_tmux_sessions_by_prefix("qemu_kernel_mcp_")
+            for tmux_name in tmux_sessions:
+                run_cmd(["tmux", "send-keys", "-t", tmux_name, "exit", "C-m"], timeout=3)
+                run_cmd(["tmux", "kill-session", "-t", tmux_name], timeout=5)
                 cleanup_results.append(
                     {
-                        "session_id": old_session.session_id,
-                        "was_running": was_running,
-                        "still_running": self._tmux_session_exists(old_session.tmux_session),
+                        "tmux_session": tmux_name,
+                        "still_running": self._tmux_session_exists(tmux_name),
                     }
                 )
 
@@ -240,6 +236,7 @@ class KernelPwnService:
         deadline = time.monotonic() + max(1.0, float(timeout))
         lines: list[str] = []
         saw_end = False
+        end_pattern = re.compile(rf"^{re.escape(end_marker)}:(\d+)$")
         try:
             with context.local(log_level="error"):
                 io = remote("127.0.0.1", serial_port, timeout=connect_timeout)
@@ -256,7 +253,7 @@ class KernelPwnService:
                         continue
                     line = raw.decode(errors="replace").replace("\r", "").rstrip("\n")
                     lines.append(line)
-                    if end_marker in line:
+                    if end_pattern.match(line.strip()):
                         saw_end = True
                         break
 
@@ -382,31 +379,36 @@ class KernelPwnService:
         if begin_idx == -1:
             return {"ok": False, "error": "begin marker not found", "output": captured.strip()}
         if end_idx == -1 or exit_code is None:
-            partial = KernelPwnService._collect_payload_lines(lines, begin_idx, begin_col, len(lines))
+            partial = KernelPwnService._collect_payload_lines(lines, begin_idx, begin_col, len(lines), begin, end)
             return {
                 "ok": False,
                 "error": "end marker with exit code not found (possible crash/timeout)",
                 "output": partial,
             }
 
-        output = KernelPwnService._collect_payload_lines(lines, begin_idx, begin_col, end_idx)
+        output = KernelPwnService._collect_payload_lines(lines, begin_idx, begin_col, end_idx, begin, end)
 
         return {"ok": True, "exit_code": exit_code, "output": output}
 
     @staticmethod
-    def _collect_payload_lines(lines: list[str], begin_idx: int, begin_col: int, stop_idx: int) -> str:
+    def _collect_payload_lines(
+        lines: list[str],
+        begin_idx: int,
+        begin_col: int,
+        stop_idx: int,
+        begin: str,
+        end: str,
+    ) -> str:
         payload_lines: list[str] = []
-        if begin_idx < stop_idx:
-            first_line = lines[begin_idx]
-            tail = first_line[begin_col + 1 :] if begin_col >= 0 else ""
-            if tail.strip():
-                payload_lines.append(tail)
+        del begin_col
         payload_lines.extend(lines[begin_idx + 1:stop_idx])
 
         cleaned: list[str] = []
         for line in payload_lines:
             stripped = line.strip()
             if not stripped:
+                continue
+            if begin in line or end in line:
                 continue
             if re.search(r".+[#$] $", line):
                 continue
@@ -419,6 +421,18 @@ class KernelPwnService:
             return False
         result = run_cmd(["tmux", "has-session", "-t", name], timeout=3)
         return result["ok"]
+
+    @staticmethod
+    def _list_tmux_sessions_by_prefix(prefix: str) -> list[str]:
+        listed = run_cmd(["tmux", "list-sessions", "-F", "#{session_name}"], timeout=3)
+        if not listed["ok"]:
+            return []
+        names: list[str] = []
+        for line in (listed["stdout"] or "").splitlines():
+            name = line.strip()
+            if name.startswith(prefix):
+                names.append(name)
+        return names
 
     def _resolve_session(self, session_id: str | None, require_running: bool = True) -> QemuSession | None:
         resolved_id = session_id or self.state.active_session_id
