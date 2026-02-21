@@ -37,12 +37,16 @@ def create_app(
 
     @mcp.tool()
     def run_command(command: str, timeout: int = 15, session_id: str = "") -> dict[str, Any]:
-        """Execute a shell command in guest through tmux-managed serial."""
+        """Execute a shell command in guest through tmux-managed serial. timeout must be <= 60 seconds."""
+        if timeout > 60:
+            return {"ok": False, "error": "timeout must be <= 60 seconds"}
         return svc.run_command(command, timeout=timeout, session_id=session_id or None)
 
     @mcp.tool()
     def run_poc(command: str = "/bin/exp", timeout: int = 20, session_id: str = "") -> dict[str, Any]:
-        """Run PoC command in guest."""
+        """Run PoC command in guest. timeout must be <= 60 seconds."""
+        if timeout > 60:
+            return {"ok": False, "error": "timeout must be <= 60 seconds"}
         return svc.run_poc(cmd=command, timeout=timeout, session_id=session_id or None)
 
     @mcp.tool()

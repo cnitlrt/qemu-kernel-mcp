@@ -6,8 +6,8 @@ MCP server for Linux kernel vulnerability research workflows.
 
 - `set_poc`: verify PoC is a statically linked ELF, then push it into guest as `/bin/exp` (prefer `wget`, fallback to serial chunk upload).
 - `run_qemu`: start QEMU and auto-assign gdb port.
-- `run_command`: execute commands in guest through one-shot `nc` over serial (tmux kept for QEMU session management).
-- `run_poc`: run PoC command in guest.
+- `run_command`: execute commands in guest through one-shot `nc` over serial (tmux kept for QEMU session management, `timeout` must be <= 60s).
+- `run_poc`: run PoC command in guest (`timeout` must be <= 60s).
 - `list_sessions`: list all active/stored QEMU sessions.
 - `stop_qemu`: stop a QEMU session by `session_id` (or active session).
 
