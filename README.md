@@ -34,6 +34,10 @@ uv run qemu-kernel-mcp --transport streamable-http --host 0.0.0.0 --port 8000
 - `run_qemu` returns `session_id`; `run_command`/`run_poc` can pass `session_id`.
 - `set_poc` requires a running QEMU session (uses active session by default or accepts `session_id`).
 - Host dependencies for command execution: `tmux`, `nc`.
+- Linux kernel images are pulled from kernelCTF prebuilt releases by default.
+  - `scripts/local_runner.sh` downloads `releases/<release_name>/bzImage` from `https://storage.googleapis.com/kernelctf-build/releases/<release_name>/bzImage` when missing.
+  - If you want to use your own kernel build, create a new folder under `scripts/releases/` and put your compiled `bzImage` into that folder.
+  - When asking the agent to run QEMU (or passing `release_name`), use the new folder name as `release_name`.
 - GDB remote target:
   - `target remote 127.0.0.1:<gdb_port>`
 - `scripts/get_root.sh`:
