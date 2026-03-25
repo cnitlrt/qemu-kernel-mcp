@@ -5,7 +5,7 @@ MCP server for Linux kernel vulnerability research workflows.
 ### Features
 
 - `set_poc`: verify PoC is a statically linked ELF, then push it into guest as `/bin/exp` (prefer `wget`, fallback to serial chunk upload).
-- `run_qemu`: start QEMU and auto-assign gdb port.
+- `run_qemu`: start QEMU, auto-assign gdb/serial ports, and preserve both launcher and guest serial logs.
 - `run_command`: execute commands in guest through one-shot `nc` over serial (tmux kept for QEMU session management, `timeout` must be <= 60s).
 - `run_poc`: run PoC command in guest (`timeout` must be <= 60s).
 - `list_sessions`: list all active/stored QEMU sessions.
@@ -32,6 +32,10 @@ uv run qemu-kernel-mcp --transport streamable-http --host 0.0.0.0 --port 8000
 
 - `run_qemu` invokes `scripts/get_root.sh <release_name>`.
 - `run_qemu` returns `session_id`; `run_command`/`run_poc` can pass `session_id`.
+- `run_qemu` writes two per-session log files:
+  - `log_path`: host-side launcher output from `get_root.sh` / shell bootstrap
+  - `serial_log_path`: guest serial console output captured from the QEMU serial TCP stream
+- `run_qemu` tips also include `serial_log_file` for quick inspection.
 - `set_poc` requires a running QEMU session (uses active session by default or accepts `session_id`).
 - Host dependencies for command execution: `tmux`, `nc`.
 - Linux kernel images are pulled from kernelCTF prebuilt releases by default.
