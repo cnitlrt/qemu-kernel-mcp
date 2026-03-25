@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from subprocess import Popen
+from typing import Any
 
 
 @dataclass
@@ -12,7 +13,10 @@ class QemuSession:
     release_name: str
     gdb_port: int
     serial_port: int
+    qemu_serial_backend_port: int
     log_path: Path
+    serial_log_path: Path
+    proxy: Any | None = None
     process: Popen[str] | None = None
     tmux_session: str | None = None
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))

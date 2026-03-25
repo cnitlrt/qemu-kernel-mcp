@@ -18,6 +18,7 @@ from pwnlib.tubes.remote import remote
 
 from .config import SCRIPTS_DIR, STATE_DIR
 from .models import QemuSession, ServerState
+from .serial_proxy import SerialLogProxy
 from .utils import allocate_port, run_cmd
 
 
@@ -82,7 +83,9 @@ class KernelPwnService:
             cleanup_results: list[dict[str, Any]] = []
             tmux_sessions = self._list_tmux_sessions_by_prefix("qemu_kernel_mcp_")
             for tmux_name in tmux_sessions:
-                run_cmd(["tmux", "send-keys", "-t", tmux_name, "exit", "C-m"], timeout=3)
+                run_cmd(
+                    ["tmux", "send-keys", "-t", tmux_name, "exit", "C-m"], timeout=3
+                )
                 run_cmd(["tmux", "kill-session", "-t", tmux_name], timeout=5)
                 cleanup_results.append(
                     {
@@ -96,28 +99,59 @@ class KernelPwnService:
 
             gdb_port = allocate_port()
             serial_port = allocate_port()
+            qemu_serial_backend_port = allocate_port()
             session_id = uuid4().hex[:8]
             tmux_name = f"qemu_kernel_mcp_{session_id}"
 
             STATE_DIR.mkdir(parents=True, exist_ok=True)
             log_path = STATE_DIR / f"qemu_{session_id}.log"
+            serial_log_path = STATE_DIR / f"qemu_{session_id}.serial.log"
+
+            proxy = SerialLogProxy(
+                listen_host="127.0.0.1",
+                listen_port=serial_port,
+                backend_host="127.0.0.1",
+                backend_port=qemu_serial_backend_port,
+                log_path=serial_log_path,
+            )
+            proxy.start()
+            if not proxy.ready.wait(timeout=1.0):
+                proxy.close()
+                return {"ok": False, "error": "failed to start serial proxy"}
 
             run_cmd(["tmux", "kill-session", "-t", tmux_name], timeout=3)
             launch_cmd = (
                 f"cd {shlex.quote(str(SCRIPTS_DIR))} && "
-                f"QEMU_GDB_PORT={gdb_port} QEMU_SERIAL_PORT={serial_port} "
+                f"QEMU_GDB_PORT={gdb_port} QEMU_SERIAL_PORT={qemu_serial_backend_port} "
                 f"bash get_root.sh {shlex.quote(release_name)} 2>&1 | tee {shlex.quote(str(log_path))}"
             )
-            created = run_cmd(["tmux", "new-session", "-d", "-s", tmux_name, f"bash -lc {shlex.quote(launch_cmd)}"])
+            created = run_cmd(
+                [
+                    "tmux",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    tmux_name,
+                    f"bash -lc {shlex.quote(launch_cmd)}",
+                ]
+            )
             if not created["ok"]:
-                return {"ok": False, "error": "failed to start tmux qemu session", "details": created}
+                proxy.close()
+                return {
+                    "ok": False,
+                    "error": "failed to start tmux qemu session",
+                    "details": created,
+                }
 
             session = QemuSession(
                 session_id=session_id,
                 release_name=release_name,
                 gdb_port=gdb_port,
                 serial_port=serial_port,
+                qemu_serial_backend_port=qemu_serial_backend_port,
                 log_path=log_path,
+                serial_log_path=serial_log_path,
+                proxy=proxy,
                 tmux_session=tmux_name,
             )
             self.state.qemu_sessions[session_id] = session
@@ -134,20 +168,26 @@ class KernelPwnService:
                     "gdb_target": f"target remote 127.0.0.1:{gdb_port}",
                     "serial_connect": (
                         "python3 -c 'from pwn import remote; "
-                        f"io=remote(\"127.0.0.1\", {serial_port}); "
+                        f'io=remote("127.0.0.1", {serial_port}); '
                         "io.interactive()'"
                     ),
                     "log_file": str(log_path),
+                    "serial_log_file": str(serial_log_path),
                 },
             }
 
-    def run_command(self, command: str, timeout: int = 20, session_id: str | None = None) -> dict[str, Any]:
+    def run_command(
+        self, command: str, timeout: int = 20, session_id: str | None = None
+    ) -> dict[str, Any]:
         with self._lock:
             session = self._resolve_session(session_id)
             if session is None:
                 return {"ok": False, "error": "no running qemu session"}
             if not self._tmux_session_exists(session.tmux_session):
-                return {"ok": False, "error": "tmux session does not exist; qemu may have exited"}
+                return {
+                    "ok": False,
+                    "error": "tmux session does not exist; qemu may have exited",
+                }
             result = self._run_nc_command(session, command, timeout=timeout)
             return {
                 "ok": result["returncode"] == 0,
@@ -160,15 +200,25 @@ class KernelPwnService:
                 "stderr": result["stderr"],
             }
 
-    def run_poc(self, cmd: str = "/bin/exp", timeout: int = 30, session_id: str | None = None) -> dict[str, Any]:
+    def run_poc(
+        self, cmd: str = "/bin/exp", timeout: int = 30, session_id: str | None = None
+    ) -> dict[str, Any]:
         return self.run_command(cmd, timeout=timeout, session_id=session_id)
 
     def list_sessions(self) -> dict[str, Any]:
         with self._lock:
-            sessions = [self._session_payload(s) for s in self.state.qemu_sessions.values()]
-            return {"ok": True, "active_session_id": self.state.active_session_id, "sessions": sessions}
+            sessions = [
+                self._session_payload(s) for s in self.state.qemu_sessions.values()
+            ]
+            return {
+                "ok": True,
+                "active_session_id": self.state.active_session_id,
+                "sessions": sessions,
+            }
 
-    def stop_qemu(self, session_id: str | None = None, force: bool = False) -> dict[str, Any]:
+    def stop_qemu(
+        self, session_id: str | None = None, force: bool = False
+    ) -> dict[str, Any]:
         del force
         with self._lock:
             session = self._resolve_session(session_id, require_running=False)
@@ -176,18 +226,29 @@ class KernelPwnService:
                 return {"ok": False, "error": "session not found"}
 
             was_running = self._tmux_session_exists(session.tmux_session)
+            if session.proxy is not None:
+                with contextlib.suppress(Exception):
+                    session.proxy.close()
             if session.tmux_session:
-                run_cmd(["tmux", "send-keys", "-t", session.tmux_session, "exit", "C-m"], timeout=3)
+                run_cmd(
+                    ["tmux", "send-keys", "-t", session.tmux_session, "exit", "C-m"],
+                    timeout=3,
+                )
                 run_cmd(["tmux", "kill-session", "-t", session.tmux_session], timeout=5)
 
             try:
-                run_cmd(["pkill", "-f", f"qemu-system-x86_64.*{session.gdb_port}"], timeout=3)
+                run_cmd(
+                    ["pkill", "-f", f"qemu-system-x86_64.*{session.gdb_port}"],
+                    timeout=3,
+                )
             except Exception:
                 pass
 
             self.state.qemu_sessions.pop(session.session_id, None)
             if self.state.active_session_id == session.session_id:
-                self.state.active_session_id = next(iter(self.state.qemu_sessions), None)
+                self.state.active_session_id = next(
+                    iter(self.state.qemu_sessions), None
+                )
 
             still_running = self._tmux_session_exists(session.tmux_session)
             return {
@@ -197,12 +258,16 @@ class KernelPwnService:
                 "still_running": still_running,
             }
 
-    def _run_nc_command(self, session: QemuSession, command: str, timeout: int) -> dict[str, Any]:
+    def _run_nc_command(
+        self, session: QemuSession, command: str, timeout: int
+    ) -> dict[str, Any]:
         begin = f"__MCP_BEGIN_{uuid4().hex[:8]}__"
         end = f"__MCP_END_{uuid4().hex[:8]}__"
         payload = f"echo {begin}; {command}; rc=$?; echo {end}:$rc\n"
 
-        proc = self._run_nc_once(session.serial_port, payload, end_marker=end, timeout=timeout)
+        proc = self._run_nc_once(
+            session.serial_port, payload, end_marker=end, timeout=timeout
+        )
         if proc.returncode != 0:
             return {
                 "returncode": 124,
@@ -276,7 +341,9 @@ class KernelPwnService:
                 with contextlib.suppress(Exception):
                     io.close()
 
-    def _upload_poc_via_serial_chunks(self, session: QemuSession, source: Path) -> dict[str, Any]:
+    def _upload_poc_via_serial_chunks(
+        self, session: QemuSession, source: Path
+    ) -> dict[str, Any]:
         data = source.read_bytes()
         start = self._run_nc_command(session, ": > /bin/exp", timeout=10)
         if start["returncode"] != 0:
@@ -284,7 +351,7 @@ class KernelPwnService:
 
         chunk_size = 128
         for idx in range(0, len(data), chunk_size):
-            chunk = data[idx:idx + chunk_size]
+            chunk = data[idx : idx + chunk_size]
             escaped = "".join(f"\\{byte:03o}" for byte in chunk)
             cmd = f"printf '{escaped}' >> /bin/exp"
             res = self._run_nc_command(session, cmd, timeout=20)
@@ -323,10 +390,18 @@ class KernelPwnService:
     def _check_static_binary(path: Path) -> dict[str, Any]:
         file_info = run_cmd(["file", "-b", str(path)], timeout=10)
         if not file_info["ok"]:
-            return {"ok": False, "error": "failed to inspect poc binary", "details": file_info}
+            return {
+                "ok": False,
+                "error": "failed to inspect poc binary",
+                "details": file_info,
+            }
         desc = (file_info["stdout"] or "").lower()
         if "elf" not in desc:
-            return {"ok": False, "error": "poc file is not an ELF binary", "file_output": file_info["stdout"]}
+            return {
+                "ok": False,
+                "error": "poc file is not an ELF binary",
+                "file_output": file_info["stdout"],
+            }
         if "statically linked" not in desc:
             return {
                 "ok": False,
@@ -377,16 +452,24 @@ class KernelPwnService:
                     break
 
         if begin_idx == -1:
-            return {"ok": False, "error": "begin marker not found", "output": captured.strip()}
+            return {
+                "ok": False,
+                "error": "begin marker not found",
+                "output": captured.strip(),
+            }
         if end_idx == -1 or exit_code is None:
-            partial = KernelPwnService._collect_payload_lines(lines, begin_idx, begin_col, len(lines), begin, end)
+            partial = KernelPwnService._collect_payload_lines(
+                lines, begin_idx, begin_col, len(lines), begin, end
+            )
             return {
                 "ok": False,
                 "error": "end marker with exit code not found (possible crash/timeout)",
                 "output": partial,
             }
 
-        output = KernelPwnService._collect_payload_lines(lines, begin_idx, begin_col, end_idx, begin, end)
+        output = KernelPwnService._collect_payload_lines(
+            lines, begin_idx, begin_col, end_idx, begin, end
+        )
 
         return {"ok": True, "exit_code": exit_code, "output": output}
 
@@ -401,7 +484,7 @@ class KernelPwnService:
     ) -> str:
         payload_lines: list[str] = []
         del begin_col
-        payload_lines.extend(lines[begin_idx + 1:stop_idx])
+        payload_lines.extend(lines[begin_idx + 1 : stop_idx])
 
         cleaned: list[str] = []
         for line in payload_lines:
@@ -434,7 +517,9 @@ class KernelPwnService:
                 names.append(name)
         return names
 
-    def _resolve_session(self, session_id: str | None, require_running: bool = True) -> QemuSession | None:
+    def _resolve_session(
+        self, session_id: str | None, require_running: bool = True
+    ) -> QemuSession | None:
         resolved_id = session_id or self.state.active_session_id
         if not resolved_id:
             return None
@@ -452,8 +537,10 @@ class KernelPwnService:
             "release_name": session.release_name,
             "gdb_port": session.gdb_port,
             "serial_port": session.serial_port,
+            "qemu_serial_backend_port": session.qemu_serial_backend_port,
             "tmux_session": session.tmux_session,
             "is_running": session.is_running,
             "started_at": session.started_at.isoformat(),
             "log_path": str(session.log_path),
+            "serial_log_path": str(session.serial_log_path),
         }

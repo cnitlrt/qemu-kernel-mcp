@@ -37,3 +37,5 @@ lib/
 lib64
 qemu_v3.sh
 test*
+!tests/
+!tests/*.py
