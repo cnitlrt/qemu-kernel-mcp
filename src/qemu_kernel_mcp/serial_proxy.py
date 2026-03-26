@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import socket
 import threading
+import time
 from pathlib import Path
 
 
@@ -24,9 +25,15 @@ class SerialLogProxy:
         self._stop = threading.Event()
         self._listener: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
+        self._backend_thread: threading.Thread | None = None
         self._workers: list[threading.Thread] = []
         self._active_sockets: set[socket.socket] = set()
         self._sockets_lock = threading.Lock()
+        self._backend_socket: socket.socket | None = None
+        self._backend_lock = threading.Lock()
+        self._backend_ready = threading.Event()
+        self._client_socket: socket.socket | None = None
+        self._client_lock = threading.Lock()
 
     def start(self) -> None:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -37,7 +44,9 @@ class SerialLogProxy:
         self._listener = listener
         self._register_socket(listener)
         self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._backend_thread = threading.Thread(target=self._backend_loop, daemon=True)
         self._accept_thread.start()
+        self._backend_thread.start()
         self.ready.set()
 
     def close(self) -> None:
@@ -51,6 +60,8 @@ class SerialLogProxy:
                 sock.close()
         if self._accept_thread is not None:
             self._accept_thread.join(timeout=1.0)
+        if self._backend_thread is not None:
+            self._backend_thread.join(timeout=1.0)
         for worker in self._workers:
             worker.join(timeout=1.0)
 
@@ -78,55 +89,124 @@ class SerialLogProxy:
             self._workers.append(worker)
             worker.start()
 
-    def _handle_client(self, client: socket.socket) -> None:
-        backend: socket.socket | None = None
-        try:
-            with client:
+    def _backend_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
                 backend = socket.create_connection(
-                    (self.backend_host, self.backend_port), timeout=1.0
+                    (self.backend_host, self.backend_port),
+                    timeout=0.5,
                 )
-                self._register_socket(backend)
-                with backend:
-                    to_backend = threading.Thread(
-                        target=self._pipe,
-                        args=(client, backend, None),
-                        daemon=True,
-                    )
-                    from_backend = threading.Thread(
-                        target=self._pipe,
-                        args=(backend, client, self.log_path),
-                        daemon=True,
-                    )
-                    to_backend.start()
-                    from_backend.start()
-                    to_backend.join()
-                    with contextlib.suppress(OSError):
-                        backend.shutdown(socket.SHUT_WR)
-                    from_backend.join()
-        finally:
-            self._unregister_socket(client)
-            if backend is not None:
+            except OSError:
+                time.sleep(0.1)
+                continue
+
+            backend.settimeout(0.2)
+            self._register_socket(backend)
+            with self._backend_lock:
+                self._backend_socket = backend
+                self._backend_ready.set()
+
+            try:
+                self._read_backend(backend)
+            finally:
+                with self._backend_lock:
+                    if self._backend_socket is backend:
+                        self._backend_socket = None
+                        self._backend_ready.clear()
                 self._unregister_socket(backend)
                 with contextlib.suppress(OSError):
                     backend.close()
-            with contextlib.suppress(OSError):
-                client.close()
+                self._close_client()
+                if not self._stop.is_set():
+                    time.sleep(0.1)
 
-    @staticmethod
-    def _pipe(src: socket.socket, dst: socket.socket, log_path: Path | None) -> None:
-        while True:
+    def _read_backend(self, backend: socket.socket) -> None:
+        while not self._stop.is_set():
             try:
-                chunk = src.recv(4096)
+                chunk = backend.recv(4096)
+            except socket.timeout:
+                continue
             except OSError:
                 break
             if not chunk:
                 break
-            if log_path is not None:
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                with log_path.open("ab") as fh:
-                    fh.write(chunk)
-                    fh.flush()
+            self._append_log(chunk)
+            client = self._current_client()
+            if client is None:
+                continue
             try:
-                dst.sendall(chunk)
+                client.sendall(chunk)
             except OSError:
-                break
+                self._close_client(client)
+
+    def _handle_client(self, client: socket.socket) -> None:
+        client.settimeout(0.2)
+        previous = self._swap_client(client)
+        if previous is not None:
+            self._close_socket(previous)
+        try:
+            with client:
+                while not self._stop.is_set():
+                    try:
+                        chunk = client.recv(4096)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    backend = self._wait_for_backend()
+                    if backend is None:
+                        break
+                    try:
+                        backend.sendall(chunk)
+                    except OSError:
+                        break
+        finally:
+            self._clear_client(client)
+            self._close_socket(client)
+
+    def _swap_client(self, client: socket.socket) -> socket.socket | None:
+        with self._client_lock:
+            previous = self._client_socket
+            self._client_socket = client
+            return previous
+
+    def _clear_client(self, client: socket.socket) -> None:
+        with self._client_lock:
+            if self._client_socket is client:
+                self._client_socket = None
+
+    def _current_client(self) -> socket.socket | None:
+        with self._client_lock:
+            return self._client_socket
+
+    def _close_client(self, client: socket.socket | None = None) -> None:
+        target = client or self._current_client()
+        if target is None:
+            return
+        self._clear_client(target)
+        self._close_socket(target)
+
+    def _close_socket(self, sock: socket.socket) -> None:
+        self._unregister_socket(sock)
+        with contextlib.suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(OSError):
+            sock.close()
+
+    def _wait_for_backend(self) -> socket.socket | None:
+        while not self._stop.is_set():
+            if not self._backend_ready.wait(timeout=0.2):
+                continue
+            with self._backend_lock:
+                backend = self._backend_socket
+            if backend is not None:
+                return backend
+        return None
+
+    def _append_log(self, chunk: bytes) -> None:
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.log_path.open("ab") as fh:
+            fh.write(chunk)
+            fh.flush()
